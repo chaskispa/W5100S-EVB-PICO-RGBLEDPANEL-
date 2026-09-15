@@ -27,6 +27,31 @@ HTTP_POLL_INTERVAL = 0.025
 BITMAP_PATH = "/saved.rgb565"
 BITMAP_TEMP_PATH = "/saved.tmp"
 BITMAP_MAGIC = b"RGB5"
+MAX_COLOR_CHANGES = 16
+
+# font5x8.bin uses CP437 positions, while received text is Unicode. These
+# custom glyphs preserve common Spanish characters and use clearer accents
+# than the compact CP437 versions.
+LED_FONT_GLYPHS = {
+    0x00C1: bytes((0xF8, 0x24, 0x22, 0x25, 0xF8)),  # Á
+    0x00C9: bytes((0xFE, 0x92, 0x92, 0x93, 0x82)),  # É
+    0x00CD: bytes((0x00, 0x84, 0xFE, 0x85, 0x00)),  # Í
+    0x00D1: bytes((0xFC, 0x09, 0x11, 0x22, 0xFE)),  # Ñ
+    0x00D3: bytes((0x78, 0x84, 0x86, 0x85, 0x78)),  # Ó
+    0x00DA: bytes((0x7C, 0x80, 0x82, 0x81, 0x7C)),  # Ú
+    0x00DC: bytes((0x7E, 0x81, 0x80, 0x81, 0x7E)),  # Ü
+    0x00E1: bytes((0x20, 0x54, 0x56, 0x79, 0x40)),  # á
+    0x00E9: bytes((0x38, 0x54, 0x56, 0x55, 0x18)),  # é
+    0x00ED: bytes((0x00, 0x44, 0x7E, 0x41, 0x00)),  # í
+    0x00F1: bytes((0x7C, 0x09, 0x05, 0x06, 0x7A)),  # ñ
+    0x00F3: bytes((0x38, 0x44, 0x46, 0x45, 0x38)),  # ó
+    0x00FA: bytes((0x3C, 0x40, 0x42, 0x21, 0x7C)),  # ú
+    0x00FC: bytes((0x3C, 0x41, 0x40, 0x21, 0x7C)),  # ü
+}
+LED_FONT_CODEPOINTS = {
+    0x00A1: 173,  # ¡
+    0x00BF: 168,  # ¿
+}
 
 DEFAULT_CONFIG = {
     "panel_count": DEFAULT_PANEL_COUNT,
@@ -184,39 +209,94 @@ def panel_color(rgb_color):
     return (green << 16) | (red << 8) | blue
 
 
+def parse_colored_text(message, max_chars):
+    """Return visible text and one RGB color per character.
+
+    UDP messages may change the active color with [RRGGBB]. Color tags do not
+    consume display characters; malformed tags are displayed literally.
+    """
+    clean = message.replace("\r", " ").replace("\n", " ").strip() or " "
+    current_color = int(config["text_color"], 16)
+    characters = []
+    colors = []
+    index = 0
+    color_changes = 0
+    while index < len(clean) and len(characters) < max_chars:
+        if (
+            index + 7 < len(clean)
+            and clean[index] == "["
+            and clean[index + 7] == "]"
+        ):
+            candidate = clean[index + 1:index + 7]
+            try:
+                next_color = int(candidate, 16)
+                if color_changes < MAX_COLOR_CHANGES:
+                    current_color = next_color
+                    color_changes += 1
+                index += 8
+                continue
+            except ValueError:
+                pass
+        characters.append(clean[index])
+        colors.append(current_color)
+        index += 1
+    if not characters:
+        characters.append(" ")
+        colors.append(current_color)
+    return clean, "".join(characters), colors
+
+
 def build_text(message, use_entrance=True):
     global text_group, text_label, text_bitmap, text_tile
     global last_message, animation_phase
     global animation_x, animation_direction, text_pixel_width, last_drawn_x
     scale = config["text_size"]
-    color = panel_color(int(config["text_color"], 16))
     max_chars = matrix_width // (6 * scale)
     # Scrolling can show a message longer than the static panel width.
     max_chars = 80 if config["animation"] != "static" else max_chars
-    clean = message.replace("\r", " ").replace("\n", " ").strip() or " "
+    clean, visible_text, character_colors = parse_colored_text(message, max_chars)
     last_message = clean
     text_group = displayio.Group(scale=scale)
-    visible_text = clean[:max_chars]
     if scale == 2:
         # Native 5x8 LED glyphs become exactly 10x16 at 2x. Unlike the
         # built-in 6x12 terminal font, no pixels or descenders are clipped.
-        text_bitmap = displayio.Bitmap(max(1, len(visible_text) * 6), 8, 2)
-        palette = displayio.Palette(2)
+        palette_colors = []
+        color_indexes = []
+        for rgb_color in character_colors:
+            if rgb_color not in palette_colors:
+                palette_colors.append(rgb_color)
+            color_indexes.append(palette_colors.index(rgb_color) + 1)
+        text_bitmap = displayio.Bitmap(
+            max(1, len(visible_text) * 6), 8, len(palette_colors) + 1
+        )
+        palette = displayio.Palette(len(palette_colors) + 1)
         palette[0] = 0x000000
         palette.make_transparent(0)
-        palette[1] = color
+        for palette_index, rgb_color in enumerate(palette_colors):
+            palette[palette_index + 1] = panel_color(rgb_color)
         for char_index, character in enumerate(visible_text):
             codepoint = ord(character)
-            if codepoint > 255:
-                codepoint = ord("?")
-            glyph_start = 2 + codepoint * 5
+            custom_glyph = LED_FONT_GLYPHS.get(codepoint)
+            if custom_glyph is None:
+                codepoint = LED_FONT_CODEPOINTS.get(codepoint, codepoint)
+                if codepoint > 255:
+                    codepoint = ord("?")
+                glyph_start = 2 + codepoint * 5
             for glyph_x in range(5):
-                column = led_font_data[glyph_start + glyph_x]
+                if custom_glyph is None:
+                    column = led_font_data[glyph_start + glyph_x]
+                else:
+                    column = custom_glyph[glyph_x]
                 for glyph_y in range(8):
                     if column & (1 << glyph_y):
-                        text_bitmap[char_index * 6 + glyph_x, glyph_y] = 1
+                        color_index = color_indexes[char_index]
+                        text_bitmap[
+                            char_index * 6 + glyph_x, glyph_y
+                        ] = color_index
                         if config["font_style"] == "bold" and glyph_x < 4:
-                            text_bitmap[char_index * 6 + glyph_x + 1, glyph_y] = 1
+                            text_bitmap[
+                                char_index * 6 + glyph_x + 1, glyph_y
+                            ] = color_index
         text_tile = displayio.TileGrid(text_bitmap, pixel_shader=palette)
         text_group.append(text_tile)
         text_label = None
@@ -224,24 +304,45 @@ def build_text(message, use_entrance=True):
         text_bitmap = None
         text_tile = None
         text_y = PANEL_HEIGHT // 2
+        runs = []
+        run_start = 0
+        for index in range(1, len(visible_text) + 1):
+            if (
+                index == len(visible_text)
+                or character_colors[index] != character_colors[run_start]
+            ):
+                runs.append((
+                    run_start,
+                    visible_text[run_start:index],
+                    character_colors[run_start],
+                ))
+                run_start = index
         if config["font_style"] == "shadow":
-            shadow = label.Label(
-                terminalio.FONT, text=visible_text, color=0x000000
+            for start, run_text, _ in runs:
+                shadow = label.Label(
+                    terminalio.FONT, text=run_text, color=0x000000
+                )
+                shadow.x = start * 6 + 1
+                shadow.y = text_y + 1
+                text_group.append(shadow)
+        text_label = None
+        for start, run_text, rgb_color in runs:
+            run_label = label.Label(
+                terminalio.FONT, text=run_text, color=panel_color(rgb_color)
             )
-            shadow.x = 1
-            shadow.y = text_y + 1
-            text_group.append(shadow)
-        text_label = label.Label(
-            terminalio.FONT, text=visible_text, color=color
-        )
-        text_label.x = 0
-        text_label.y = text_y
-        text_group.append(text_label)
+            run_label.x = start * 6
+            run_label.y = text_y
+            text_group.append(run_label)
+            if text_label is None:
+                text_label = run_label
         if config["font_style"] == "bold":
-            bold = label.Label(terminalio.FONT, text=visible_text, color=color)
-            bold.x = 1
-            bold.y = text_label.y
-            text_group.append(bold)
+            for start, run_text, rgb_color in runs:
+                bold = label.Label(
+                    terminalio.FONT, text=run_text, color=panel_color(rgb_color)
+                )
+                bold.x = start * 6 + 1
+                bold.y = text_y
+                text_group.append(bold)
     text_pixel_width = max(1, len(visible_text) * 6 * scale)
     entrance = config["animation_in"] if use_entrance else "none"
     if entrance == "left":
@@ -258,7 +359,7 @@ def build_text(message, use_entrance=True):
     last_drawn_x = int(animation_x)
     display.root_group = text_group
     display.refresh(minimum_frames_per_second=0)
-    print("Text:", clean[:max_chars])
+    print("Text:", visible_text)
 
 
 def show_text(message):

@@ -79,6 +79,20 @@ Example:
 printf 'Hello' | nc -u PANEL_IP 5000
 ```
 
+Use `[RRGGBB]` before a block of text to set that block's color. Tags contain
+six hexadecimal RGB digits, are case-insensitive, and do not use display
+space. Text before the first tag uses the color configured in the web UI.
+
+```sh
+printf '[FF0000]RED [00FF00]GREEN [0000FF]BLUE' | nc -u PANEL_IP 5000
+printf '[FFFFFF]Español [00FFFF]Ñ' | nc -u PANEL_IP 5000
+```
+
+Malformed tags are displayed as ordinary text. Each valid tag remains active
+until the next valid color tag or the end of the message. A datagram may
+contain up to 16 color changes. UTF-8 Spanish characters are preserved in the
+large font: `á é í ó ú ü ñ`, their uppercase forms, `¿`, and `¡`.
+
 The web UI controls persistent text color, panel color order (`RGB` or `GRB`),
 font scale (`1x` or `2x`), font style (regular, bold, or shadow), animation,
 entrance and exit effects, and animation speed. Appearance changes apply
