@@ -16,7 +16,7 @@ import adafruit_wiznet5k.adafruit_wiznet5k_socketpool as socketpool
 from adafruit_wiznet5k.adafruit_wiznet5k import WIZNET5K
 
 
-DEFAULT_PANEL_COUNT = 3
+DEFAULT_PANEL_COUNT = 12
 SUPPORTED_PANEL_COUNTS = (3, 6, 9, 12)
 PANEL_WIDTH = 32
 PANEL_HEIGHT = 16
@@ -56,7 +56,7 @@ LED_FONT_CODEPOINTS = {
 DEFAULT_CONFIG = {
     "panel_count": DEFAULT_PANEL_COUNT,
     "text_color": "FFFFFF",
-    "text_size": 1,
+    "text_size": 4,
     "color_order": "GRB",
     "font_style": "regular",
     "animation": "static",
@@ -121,8 +121,9 @@ def validate_config(candidate):
         result["text_size"] = int(result["text_size"])
     except (ValueError, TypeError):
         result["text_size"] = 1
-    if result["text_size"] not in (1, 2):
-        result["text_size"] = 1
+    allowed_text_sizes = (1, 2, 3, 4) if result["panel_count"] == 12 else (1, 2)
+    if result["text_size"] not in allowed_text_sizes:
+        result["text_size"] = 4 if result["panel_count"] == 12 else 2
     try:
         result["speed"] = int(result["speed"])
     except (ValueError, TypeError):
@@ -164,14 +165,21 @@ panel_count = config["panel_count"]
 
 # HUB75 display -------------------------------------------------------------
 
-matrix_width = PANEL_WIDTH * panel_count
+# The 12-panel installation is wired as two rows of six. The chain enters the
+# upper-left panel, crosses the top row, then folds down and crosses the lower
+# row from right to left. CircuitPython's tiled serpentine mapping turns that
+# physical chain into one continuous 192x32 drawing surface.
+panel_rows = 2 if panel_count == 12 else 1
+panel_columns = panel_count // panel_rows
+matrix_width = PANEL_WIDTH * panel_columns
+matrix_height = PANEL_HEIGHT * panel_rows
 displayio.release_displays()
 matrix = rgbmatrix.RGBMatrix(
     width=matrix_width,
-    height=PANEL_HEIGHT,
+    height=matrix_height,
     bit_depth=BIT_DEPTH,
-    tile=1,
-    serpentine=False,
+    tile=panel_rows,
+    serpentine=panel_rows > 1,
     rgb_pins=[board.GP0, board.GP1, board.GP2,
               board.GP3, board.GP4, board.GP5],
     addr_pins=[board.GP6, board.GP7, board.GP8],
@@ -190,7 +198,7 @@ text_bitmap = None
 text_tile = None
 image_bitmap = None
 image_tile = None
-last_message = "NETWORK..."
+last_message = "NETWORK..." if config["dhcp"] else " "
 pending_message = None
 animation_phase = "steady"
 animation_x = 0.0
@@ -257,8 +265,9 @@ def build_text(message, use_entrance=True):
     clean, visible_text, character_colors = parse_colored_text(message, max_chars)
     last_message = clean
     text_group = displayio.Group(scale=scale)
-    if scale == 2:
-        # Native 5x8 LED glyphs become exactly 10x16 at 2x. Unlike the
+    if scale >= 2:
+        text_group.y = (matrix_height - 8 * scale) // 2
+        # Native 5x8 LED glyphs scale cleanly up to 20x32 at 4x. Unlike the
         # built-in 6x12 terminal font, no pixels or descenders are clipped.
         palette_colors = []
         color_indexes = []
@@ -303,7 +312,9 @@ def build_text(message, use_entrance=True):
     else:
         text_bitmap = None
         text_tile = None
-        text_y = PANEL_HEIGHT // 2
+        # label.Label positions text around its baseline, so its center belongs
+        # at the vertical midpoint of the complete logical display.
+        text_y = matrix_height // 2
         runs = []
         run_start = 0
         for index in range(1, len(visible_text) + 1):
@@ -381,7 +392,7 @@ def show_saved_bitmap():
                 return False
             width = int.from_bytes(bitmap_file.read(2), "big")
             height = int.from_bytes(bitmap_file.read(2), "big")
-            if width != matrix_width or height != PANEL_HEIGHT:
+            if width != matrix_width or height != matrix_height:
                 return False
             image_bitmap = displayio.Bitmap(width, height, 65536)
             for pixel in range(width * height):
@@ -456,7 +467,12 @@ def update_animation():
         display.refresh(minimum_frames_per_second=0)
 
 
-build_text("NETWORK...", use_entrance=False)
+if config["dhcp"]:
+    build_text("NETWORK...", use_entrance=False)
+else:
+    # Fixed-IP installations remain completely dark until content arrives.
+    display.root_group = displayio.Group()
+    display.refresh(minimum_frames_per_second=0)
 
 
 # Ethernet -----------------------------------------------------------------
@@ -471,7 +487,8 @@ if not config["dhcp"]:
     )
 
 ip_address = ethernet.pretty_ip(ethernet.ip_address)
-build_text(ip_address, use_entrance=False)
+if config["dhcp"]:
+    build_text(ip_address, use_entrance=False)
 
 text_udp = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
 text_udp.settimeout(0)
@@ -540,8 +557,14 @@ def text_option(value, current, title):
 def web_page(message=""):
     dhcp_checked = " checked" if config["dhcp"] else ""
     static_checked = "" if config["dhcp"] else " checked"
-    size_options = option(1, config["text_size"], "Normal (1x)")
-    size_options += option(2, config["text_size"], "Large (2x)")
+    if config["panel_count"] == 12:
+        size_options = option(1, config["text_size"], "Small (1x, 8 px)")
+        size_options += option(2, config["text_size"], "Medium (2x, 16 px)")
+        size_options += option(3, config["text_size"], "Large (3x, 24 px)")
+        size_options += option(4, config["text_size"], "Full height (4x, 32 px)")
+    else:
+        size_options = option(1, config["text_size"], "Normal (1x)")
+        size_options += option(2, config["text_size"], "Large (2x)")
     rgb_selected = " selected" if config["color_order"] == "RGB" else ""
     grb_selected = " selected" if config["color_order"] == "GRB" else ""
     font_options = text_option("regular", config["font_style"], "Regular")
@@ -560,7 +583,9 @@ def web_page(message=""):
     panel_options = option(3, config["panel_count"], "3 panels (96x16)")
     panel_options += option(6, config["panel_count"], "6 panels (192x16)")
     panel_options += option(9, config["panel_count"], "9 panels (288x16)")
-    panel_options += option(12, config["panel_count"], "12 panels (384x16)")
+    panel_options += option(
+        12, config["panel_count"], "12 panels (6x2 serpentine, 192x32)"
+    )
     notice = "<p class='ok'>{}</p>".format(message) if message else ""
     return """<!doctype html><html><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -628,7 +653,7 @@ async function uploadBitmap(){{
  URL.revokeObjectURL(img.src);
 }}
 </script></body></html>""".format(
-        ip=ip_address, width=matrix_width, height=PANEL_HEIGHT,
+        ip=ip_address, width=matrix_width, height=matrix_height,
         udp_port=TEXT_UDP_PORT, notice=notice,
         color=config["text_color"], size_options=size_options,
         rgb_selected=rgb_selected, grb_selected=grb_selected,
@@ -690,7 +715,7 @@ def poll_http():
                 headers[key.strip().lower()] = value.strip()
 
         if method == "POST" and target == "/bitmap":
-            expected = matrix_width * PANEL_HEIGHT * 2
+            expected = matrix_width * matrix_height * 2
             content_length = int(headers.get("content-length", "0"))
             if content_length != expected:
                 send_http(client, "400 Bad Request",
@@ -700,7 +725,8 @@ def poll_http():
                 with open(BITMAP_TEMP_PATH, "wb") as bitmap_file:
                     bitmap_file.write(BITMAP_MAGIC)
                     bitmap_file.write(bytes((matrix_width >> 8, matrix_width & 0xFF)))
-                    bitmap_file.write(bytes((0, PANEL_HEIGHT)))
+                    bitmap_file.write(bytes((matrix_height >> 8,
+                                             matrix_height & 0xFF)))
                     initial = body_start[:expected]
                     bitmap_file.write(initial)
                     received = len(initial)
@@ -780,14 +806,17 @@ def poll_http():
 
 print("RGB Ethernet UDP text ready")
 print("IP:", ip_address, "Web: http://{}/".format(ip_address))
-print("Panels:", panel_count, "Canvas:", matrix_width, "x", PANEL_HEIGHT)
+print("Panels:", panel_count, "Layout:", panel_columns, "x", panel_rows,
+      "Canvas:", matrix_width, "x", matrix_height,
+      "Serpentine:", panel_rows > 1)
 print("UDP text port:", TEXT_UDP_PORT)
 print("Color: #" + config["text_color"], "Size:", config["text_size"],
       "Order:", config["color_order"])
 print("Font:", config["font_style"], "Animation:", config["animation"],
       "Speed:", config["speed"], "px/s")
 
-show_saved_bitmap()
+if config["dhcp"]:
+    show_saved_bitmap()
 
 last_http_poll = 0.0
 last_dhcp_maintenance = time.monotonic()

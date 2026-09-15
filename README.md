@@ -1,6 +1,10 @@
 # W5100S-EVB-PICO RGB Panel Ethernet
 
-CircuitPython controller for a chain of three or six `32x16` HUB75 panels.
+CircuitPython controller for `32x16` HUB75 panels. It supports horizontal
+chains of 3, 6, or 9 panels, plus a 12-panel serpentine wall arranged as six
+panels across by two panels high. The 12-panel wall behaves as one `192x32`
+display and is the default layout on a fresh installation. Its default `4x`
+font fills the entire 32-pixel display height.
 
 ## Install on the W5100S-EVB-PICO
 
@@ -18,16 +22,7 @@ CircuitPython controller for a chain of three or six `32x16` HUB75 panels.
 5. The boot drive will disconnect automatically and a new drive named
    `CIRCUITPY` will appear.
 
-### 2. Configure the panel count
-
-Change `PANEL_COUNT` near the top of `code.py` to `3` or `6`, then restart the
-board:
-
-```python
-PANEL_COUNT = 3
-```
-
-### 3. Copy the project
+### 2. Copy the project
 
 Copy these items to the root of `CIRCUITPY`, preserving the `lib` directory:
 
@@ -59,6 +54,22 @@ for the onboard W5100S. Connect the HUB75 panels in one chain from `OUT` to
 Power the panels from a separate regulated `5 V` supply with enough current for
 the complete chain. Connect the panel power-supply ground to a GND pin on the
 W5100S-EVB-PICO. Do not power the panel chain from USB.
+
+### 12-panel serpentine layout
+
+Select **12 panels (6x2 serpentine, 192x32)** in the web interface. Viewed from
+the front, number and daisy-chain the panels in this order:
+
+```text
+DATA IN -> [1] -> [2] -> [3] -> [4] -> [5] -> [6]
+                                                   |
+          [12] <- [11] <- [10] <- [9] <- [8] <- [7]
+```
+
+Connect panel 6 `OUT` to panel 7 `IN` at the right edge. Rotate every panel in
+the bottom row by 180 degrees so the short serpentine connections line up.
+CircuitPython's tiled serpentine mapping corrects the rotated lower row and
+presents the whole assembly as a single `192x32` canvas.
 
 ## First setup
 
@@ -94,15 +105,17 @@ contain up to 16 color changes. UTF-8 Spanish characters are preserved in the
 large font: `á é í ó ú ü ñ`, their uppercase forms, `¿`, and `¡`.
 
 The web UI controls persistent text color, panel color order (`RGB` or `GRB`),
-font scale (`1x` or `2x`), font style (regular, bold, or shadow), animation,
-entrance and exit effects, and animation speed. Appearance changes apply
-immediately without a reboot. Static messages are clipped; animated messages
-can contain up to 80 characters. A Send Message form displays text directly
-from the browser using the active appearance and animation settings.
+font scale, font style (regular, bold, or shadow), animation, entrance and exit
+effects, and animation speed. The 16-pixel-high layouts offer `1x` and `2x`
+font sizes. The 12-panel `192x32` layout also offers `3x` (24 pixels high) and
+`4x` (the full 32-pixel height). Appearance changes apply immediately without
+a reboot. Static messages are clipped; animated messages can contain up to 80
+characters. A Send Message form displays text directly from the browser using
+the active appearance and animation settings.
 
-Large (`2x`) text uses a lightweight native 5x8 LED bitmap font rendered at
-10x16 pixels per glyph. It fits the panel height exactly, including letters
-with descenders, without loading the memory-heavy BDF font system.
+Scaled (`2x` through `4x`) text uses a lightweight native 5x8 LED bitmap font.
+At `4x`, each glyph occupies 20x32 pixels and fills the complete 12-panel wall
+height without loading the memory-heavy BDF font system.
 
 The web interface can upload any browser-supported image. The browser resizes
 it to the active panel canvas and sends RGB565 data, which is stored as
@@ -110,12 +123,19 @@ it to the active panel canvas and sends RGB565 data, which is stored as
 the filesystem during normal operation, so the USB CIRCUITPY drive is
 read-only to the host; use the UF2 bootloader when firmware files must change.
 
-Panel count (`3`, `6`, `9`, or `12`) is persistent and configurable in the web UI.
-Changing it restarts the controller so the HUB75 framebuffer can be rebuilt at
-the corresponding `96x16`, `192x16`, `288x16`, or `384x16` size.
+Panel count (`3`, `6`, `9`, or `12`) is persistent and configurable in the web
+UI. Changing it restarts the controller so the HUB75 framebuffer can be rebuilt
+at `96x16`, `192x16`, `288x16`, or `192x32`, respectively. The first three
+layouts are single horizontal rows; the 12-panel layout is the 6-by-2
+serpentine wall shown above.
 
 ## Network
 
 The web UI supports DHCP or a static IPv4 address, subnet mask, gateway, and DNS
 server. When changing to a static address, reconnect the browser using the new
 address after the board reloads.
+
+Static IP mode is intended for permanent installations. At boot the panel wall
+stays completely blank: it does not show the network message, its IP address,
+or a saved bitmap. The first UDP text datagram supplies the content to display.
+DHCP mode retains the visible network and IP startup indicators.
