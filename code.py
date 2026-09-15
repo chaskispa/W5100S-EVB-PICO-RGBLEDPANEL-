@@ -12,16 +12,21 @@ import rgbmatrix
 import supervisor
 import terminalio
 from adafruit_display_text import label
+import adafruit_wiznet5k.adafruit_wiznet5k as wiznet5k
 import adafruit_wiznet5k.adafruit_wiznet5k_socketpool as socketpool
 from adafruit_wiznet5k.adafruit_wiznet5k import WIZNET5K
 
 
 DEFAULT_PANEL_COUNT = 12
-SUPPORTED_PANEL_COUNTS = (3, 6, 9, 12)
+SUPPORTED_PANEL_COUNTS = (3, 6, 9, 12, 18)
 PANEL_WIDTH = 32
 PANEL_HEIGHT = 16
 BIT_DEPTH = 4
 TEXT_UDP_PORT = 5000
+BITMAP_UDP_PORT = 5001
+BITMAP_UDP_MAGIC = b"RGBU"
+BITMAP_UDP_HEADER_SIZE = 8
+BITMAP_UDP_CHUNK_SIZE = 1024
 HTTP_PORT = 80
 HTTP_POLL_INTERVAL = 0.025
 BITMAP_PATH = "/saved.rgb565"
@@ -165,21 +170,33 @@ panel_count = config["panel_count"]
 
 # HUB75 display -------------------------------------------------------------
 
-# The 12-panel installation is wired as two rows of six. The chain enters the
-# upper-left panel, crosses the top row, then folds down and crosses the lower
-# row from right to left. CircuitPython's tiled serpentine mapping turns that
-# physical chain into one continuous 192x32 drawing surface.
-panel_rows = 2 if panel_count == 12 else 1
-panel_columns = panel_count // panel_rows
+# Multi-row installations fold the chain at the end of each row. The 12-panel
+# layout is 6x2 (192x32); the special bitmap layout is 3x6 (96x96).
+if panel_count == 18:
+    panel_columns = 3
+    panel_rows = 6
+elif panel_count == 12:
+    panel_columns = 6
+    panel_rows = 2
+else:
+    panel_columns = panel_count
+    panel_rows = 1
 matrix_width = PANEL_WIDTH * panel_columns
 matrix_height = PANEL_HEIGHT * panel_rows
 displayio.release_displays()
 matrix = rgbmatrix.RGBMatrix(
     width=matrix_width,
     height=matrix_height,
-    bit_depth=BIT_DEPTH,
+    # The 96x96 installation only needs the eight combinations of full/off
+    # red, green, and blue. One bit per channel also leaves more RAM and scan
+    # time available for Ethernet traffic.
+    bit_depth=1 if panel_count == 18 else BIT_DEPTH,
+    doublebuffer=panel_count != 18,
     tile=panel_rows,
-    serpentine=panel_rows > 1,
+    # The 18-panel wall begins at the top-right and snakes downward in rows.
+    # Its first row is the rotated row, opposite Protomatter's built-in parity,
+    # so that layout is remapped explicitly below.
+    serpentine=panel_rows > 1 and panel_count != 18,
     rgb_pins=[board.GP0, board.GP1, board.GP2,
               board.GP3, board.GP4, board.GP5],
     addr_pins=[board.GP6, board.GP7, board.GP8],
@@ -187,6 +204,7 @@ matrix = rgbmatrix.RGBMatrix(
     latch_pin=board.GP10,
     output_enable_pin=board.GP11,
 )
+matrix_buffer = memoryview(matrix) if panel_count == 18 else None
 display = framebufferio.FramebufferDisplay(matrix, auto_refresh=False, rotation=0)
 with open("/font5x8.bin", "rb") as font_file:
     led_font_data = font_file.read()
@@ -198,6 +216,9 @@ text_bitmap = None
 text_tile = None
 image_bitmap = None
 image_tile = None
+bitmap_frame_id = -1
+bitmap_chunks_received = 0
+bitmap_frame_complete = False
 last_message = "NETWORK..." if config["dhcp"] else " "
 pending_message = None
 animation_phase = "steady"
@@ -215,6 +236,95 @@ def panel_color(rgb_color):
     green = (rgb_color >> 8) & 0xFF
     blue = rgb_color & 0xFF
     return (green << 16) | (red << 8) | blue
+
+
+def top_down_serpentine_index(source_pixel):
+    """Map 96x96 pixels to rows of three, starting at the top-right."""
+    source_x = source_pixel % matrix_width
+    source_y = source_pixel // matrix_width
+    panel_column = source_x // PANEL_WIDTH
+    panel_row = source_y // PANEL_HEIGHT
+    local_x = source_x % PANEL_WIDTH
+    local_y = source_y % PANEL_HEIGHT
+
+    # Physical rows 1, 3, and 5 are rotated 180 degrees. The chain therefore
+    # runs right-to-left across the top three panels, left-to-right across the
+    # next three, and repeats while moving from the top toward the bottom.
+    if not (panel_row & 1):
+        storage_column = panel_columns - 1 - panel_column
+        local_x = PANEL_WIDTH - 1 - local_x
+        local_y = PANEL_HEIGHT - 1 - local_y
+    else:
+        storage_column = panel_column
+    return (
+        (panel_row * PANEL_HEIGHT + local_y) * matrix_width
+        + storage_column * PANEL_WIDTH
+        + local_x
+    )
+
+
+def special_text_pixel(x, y, color):
+    """Draw one logical text pixel through the verified 18-panel mapping."""
+    if x < 0 or x >= matrix_width or y < 0 or y >= matrix_height:
+        return
+    adjusted = panel_color(color)
+    rgb565 = (
+        ((adjusted >> 19) & 0x1F) << 11
+        | ((adjusted >> 10) & 0x3F) << 5
+        | ((adjusted >> 3) & 0x1F)
+    )
+    matrix_buffer[top_down_serpentine_index(y * matrix_width + x)] = rgb565
+
+
+def panel_rgb565(value):
+    """Apply the configured RGB/GRB wiring order to an RGB565 pixel."""
+    if config["color_order"] == "RGB":
+        return value
+    red5 = (value >> 11) & 0x1F
+    green6 = (value >> 5) & 0x3F
+    blue5 = value & 0x1F
+    # Convert green 6-bit to red 5-bit and expand red 5-bit to green 6-bit.
+    return (
+        (green6 >> 1) << 11
+        | ((red5 << 1) | (red5 >> 4)) << 5
+        | blue5
+    )
+
+
+def render_special_text(visible_text, character_colors, scale):
+    """Render 5x8 text directly for the custom 96x96 panel order."""
+    display.root_group = displayio.Group()
+    display.refresh(minimum_frames_per_second=0)
+    for pixel in range(matrix_width * matrix_height):
+        matrix_buffer[pixel] = 0
+
+    origin_y = (matrix_height - 8 * scale) // 2
+    for char_index, character in enumerate(visible_text):
+        codepoint = ord(character)
+        custom_glyph = LED_FONT_GLYPHS.get(codepoint)
+        if custom_glyph is None:
+            codepoint = LED_FONT_CODEPOINTS.get(codepoint, codepoint)
+            if codepoint > 255:
+                codepoint = ord("?")
+            glyph_start = 2 + codepoint * 5
+        for glyph_x in range(5):
+            column = (
+                led_font_data[glyph_start + glyph_x]
+                if custom_glyph is None else custom_glyph[glyph_x]
+            )
+            for glyph_y in range(8):
+                if not column & (1 << glyph_y):
+                    continue
+                for scale_y in range(scale):
+                    for scale_x in range(scale):
+                        x = (char_index * 6 + glyph_x) * scale + scale_x
+                        y = origin_y + glyph_y * scale + scale_y
+                        special_text_pixel(x, y, character_colors[char_index])
+                        if config["font_style"] == "bold":
+                            special_text_pixel(
+                                x + 1, y, character_colors[char_index]
+                            )
+    matrix.refresh()
 
 
 def parse_colored_text(message, max_chars):
@@ -256,7 +366,7 @@ def parse_colored_text(message, max_chars):
 
 def build_text(message, use_entrance=True):
     global text_group, text_label, text_bitmap, text_tile
-    global last_message, animation_phase
+    global last_message, pending_message, animation_phase
     global animation_x, animation_direction, text_pixel_width, last_drawn_x
     scale = config["text_size"]
     max_chars = matrix_width // (6 * scale)
@@ -264,6 +374,20 @@ def build_text(message, use_entrance=True):
     max_chars = 80 if config["animation"] != "static" else max_chars
     clean, visible_text, character_colors = parse_colored_text(message, max_chars)
     last_message = clean
+    if panel_count == 18:
+        text_group = None
+        text_label = None
+        text_bitmap = None
+        text_tile = None
+        pending_message = None
+        animation_phase = "steady"
+        animation_x = 0.0
+        animation_direction = -1
+        text_pixel_width = max(1, len(visible_text) * 6 * scale)
+        last_drawn_x = 0
+        render_special_text(visible_text, character_colors, scale)
+        print("Text:", visible_text)
+        return
     text_group = displayio.Group(scale=scale)
     if scale >= 2:
         text_group.y = (matrix_height - 8 * scale) // 2
@@ -486,6 +610,10 @@ if not config["dhcp"]:
         pool.inet_aton(config[key]) for key in ("ip", "mask", "gateway", "dns")
     )
 
+while not ethernet.link_status:
+    print("Waiting for Ethernet link...")
+    time.sleep(1)
+
 ip_address = ethernet.pretty_ip(ethernet.ip_address)
 if config["dhcp"]:
     build_text(ip_address, use_entrance=False)
@@ -499,6 +627,20 @@ http_server.settimeout(0)
 http_server.bind((ip_address, HTTP_PORT))
 http_server.listen(1)
 text_packet = bytearray(1024)
+
+bitmap_udp = None
+bitmap_packet = None
+bitmap_frame_bytes = matrix_width * matrix_height * 2
+bitmap_chunk_count = (
+    bitmap_frame_bytes + BITMAP_UDP_CHUNK_SIZE - 1
+) // BITMAP_UDP_CHUNK_SIZE
+if panel_count == 18:
+    bitmap_udp = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
+    bitmap_udp.settimeout(0)
+    bitmap_udp.bind((ip_address, BITMAP_UDP_PORT))
+    bitmap_packet = bytearray(
+        BITMAP_UDP_HEADER_SIZE + BITMAP_UDP_CHUNK_SIZE
+    )
 
 
 def poll_text_udp():
@@ -514,6 +656,83 @@ def poll_text_udp():
         print("Ignored invalid UTF-8 from", remote)
         return
     show_text(message)
+
+
+def poll_bitmap_udp():
+    """Receive one chunk of a 96x96 RGB565 frame in special panel mode."""
+    global bitmap_frame_id, bitmap_chunks_received, bitmap_frame_complete
+    global text_group, pending_message, image_bitmap, image_tile
+    if bitmap_udp is None:
+        return
+    try:
+        size, remote = bitmap_udp.recvfrom_into(bitmap_packet)
+    except Exception:
+        return
+    if size < BITMAP_UDP_HEADER_SIZE:
+        return
+    if bytes(bitmap_packet[0:4]) != BITMAP_UDP_MAGIC:
+        return
+
+    frame_id = (bitmap_packet[4] << 8) | bitmap_packet[5]
+    chunk_index = bitmap_packet[6]
+    advertised_chunks = bitmap_packet[7]
+    if advertised_chunks != bitmap_chunk_count or chunk_index >= bitmap_chunk_count:
+        return
+
+    byte_offset = chunk_index * BITMAP_UDP_CHUNK_SIZE
+    expected_payload = min(
+        BITMAP_UDP_CHUNK_SIZE, bitmap_frame_bytes - byte_offset
+    )
+    if size - BITMAP_UDP_HEADER_SIZE != expected_payload:
+        return
+
+    if frame_id != bitmap_frame_id:
+        bitmap_frame_id = frame_id
+        bitmap_chunks_received = 0
+        bitmap_frame_complete = False
+    chunk_bit = 1 << chunk_index
+    if bitmap_chunks_received & chunk_bit:
+        if bitmap_frame_complete:
+            try:
+                bitmap_udp.sendto(
+                    BITMAP_UDP_MAGIC
+                    + bytes((frame_id >> 8, frame_id & 0xFF))
+                    + b"OK",
+                    remote,
+                )
+            except Exception:
+                pass
+        return
+
+    source_pixel = byte_offset // 2
+    payload_start = BITMAP_UDP_HEADER_SIZE
+    for source_index in range(payload_start, size, 2):
+        matrix_buffer[top_down_serpentine_index(source_pixel)] = panel_rgb565(
+            (bitmap_packet[source_index] << 8)
+            | bitmap_packet[source_index + 1]
+        )
+        source_pixel += 1
+    bitmap_chunks_received |= chunk_bit
+
+    complete_mask = (1 << bitmap_chunk_count) - 1
+    if bitmap_chunks_received == complete_mask and not bitmap_frame_complete:
+        bitmap_frame_complete = True
+        text_group = None
+        pending_message = None
+        image_bitmap = None
+        image_tile = None
+        matrix.refresh()
+        try:
+            bitmap_udp.sendto(
+                BITMAP_UDP_MAGIC
+                + bytes((frame_id >> 8, frame_id & 0xFF))
+                + b"OK",
+                remote,
+            )
+        except Exception:
+            pass
+        print("UDP bitmap:", matrix_width, "x", matrix_height,
+              "frame", frame_id)
 
 
 # Web configuration ---------------------------------------------------------
@@ -586,6 +805,13 @@ def web_page(message=""):
     panel_options += option(
         12, config["panel_count"], "12 panels (6x2 serpentine, 192x32)"
     )
+    panel_options += option(
+        18, config["panel_count"], "18 panels (3x6 serpentine, 96x96)"
+    )
+    bitmap_udp_status = (
+        " &middot; Bitmap UDP {}".format(BITMAP_UDP_PORT)
+        if panel_count == 18 else ""
+    )
     notice = "<p class='ok'>{}</p>".format(message) if message else ""
     return """<!doctype html><html><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -596,7 +822,7 @@ input,select,button{{font:inherit;padding:7px}}input[type=text],select{{width:10
 input[type=color]{{width:80px;height:42px;padding:2px;vertical-align:middle}}
 button{{background:#19a974;color:white;border:0;padding:10px 18px}}.ok{{color:#5fdb9a}}.muted{{color:#aaa}}
 </style></head><body><h1>UDP Text Display</h1>
-<p>IP: <b>{ip}</b> &middot; {width}x{height} &middot; UDP {udp_port}</p>{notice}
+<p>IP: <b>{ip}</b> &middot; {width}x{height} &middot; Text UDP {udp_port}{bitmap_udp_status}</p>{notice}
 <form action='/message' method='get'><fieldset><legend>Send message</legend>
 <label>Text<input name='text' type='text' maxlength='80' required
  placeholder='Message to display'></label>
@@ -654,7 +880,8 @@ async function uploadBitmap(){{
 }}
 </script></body></html>""".format(
         ip=ip_address, width=matrix_width, height=matrix_height,
-        udp_port=TEXT_UDP_PORT, notice=notice,
+        udp_port=TEXT_UDP_PORT, bitmap_udp_status=bitmap_udp_status,
+        notice=notice,
         color=config["text_color"], size_options=size_options,
         rgb_selected=rgb_selected, grb_selected=grb_selected,
         font_options=font_options, motion_options=motion_options,
@@ -683,12 +910,38 @@ def send_http(client, status, body):
             sent += count
 
 
+def restart_http_listener():
+    """Reuse the listener socket after serving an HTTP request in place."""
+    http_server.settimeout(0)
+    try:
+        ethernet.socket_close(http_server._socknum)
+    except Exception as error:
+        print("HTTP socket close error:", error)
+    try:
+        http_server.listen(1)
+    except Exception as error:
+        print("HTTP listener restart error:", error)
+
+
 def poll_http():
     global config
     try:
-        client, remote = http_server.accept()
+        status = http_server._status
     except Exception:
         return False
+    if status in (wiznet5k.SNSR_SOCK_LISTEN, wiznet5k.SNSR_SOCK_SYNRECV):
+        return False
+    if status not in (
+        wiznet5k.SNSR_SOCK_ESTABLISHED,
+        wiznet5k.SNSR_SOCK_CLOSE_WAIT,
+    ):
+        restart_http_listener()
+        return False
+
+    # Socket.accept() allocates another reserved socket. The W5100S cannot do
+    # that while text UDP, bitmap UDP, and the HTTP listener are all active, so
+    # serve this connection directly and reopen the same socket afterward.
+    client = http_server
     should_reload = False
     try:
         client.settimeout(2.0)
@@ -800,7 +1053,7 @@ def poll_http():
     except Exception as error:
         print("HTTP error:", error)
     finally:
-        client.close()
+        restart_http_listener()
     return should_reload
 
 
@@ -808,8 +1061,12 @@ print("RGB Ethernet UDP text ready")
 print("IP:", ip_address, "Web: http://{}/".format(ip_address))
 print("Panels:", panel_count, "Layout:", panel_columns, "x", panel_rows,
       "Canvas:", matrix_width, "x", matrix_height,
-      "Serpentine:", panel_rows > 1)
+      "Serpentine:", "top-down rows" if panel_count == 18 else panel_rows > 1)
 print("UDP text port:", TEXT_UDP_PORT)
+if bitmap_udp is not None:
+    print("UDP bitmap port:", BITMAP_UDP_PORT,
+          "Frame:", matrix_width, "x", matrix_height, "RGB565",
+          bitmap_chunk_count, "chunks")
 print("Color: #" + config["text_color"], "Size:", config["text_size"],
       "Order:", config["color_order"])
 print("Font:", config["font_style"], "Animation:", config["animation"],
@@ -821,6 +1078,7 @@ if config["dhcp"]:
 last_http_poll = 0.0
 last_dhcp_maintenance = time.monotonic()
 while True:
+    poll_bitmap_udp()
     poll_text_udp()
     update_animation()
     now = time.monotonic()

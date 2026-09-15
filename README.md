@@ -1,10 +1,11 @@
 # W5100S-EVB-PICO RGB Panel Ethernet
 
 CircuitPython controller for `32x16` HUB75 panels. It supports horizontal
-chains of 3, 6, or 9 panels, plus a 12-panel serpentine wall arranged as six
-panels across by two panels high. The 12-panel wall behaves as one `192x32`
-display and is the default layout on a fresh installation. Its default `4x`
-font fills the entire 32-pixel display height.
+chains of 3, 6, or 9 panels, a 12-panel serpentine wall arranged as six panels
+across by two panels high, and a special 18-panel 3-by-6 serpentine bitmap wall.
+The 12-panel wall behaves as one `192x32` display and is the default layout on
+a fresh installation. Its default `4x` font fills the entire 32-pixel display
+height. The special 18-panel mode behaves as one `96x96` display.
 
 ## Install on the W5100S-EVB-PICO
 
@@ -71,6 +72,58 @@ the bottom row by 180 degrees so the short serpentine connections line up.
 CircuitPython's tiled serpentine mapping corrects the rotated lower row and
 presents the whole assembly as a single `192x32` canvas.
 
+### 18-panel 96x96 bitmap layout
+
+Select **18 panels (3x6 serpentine, 96x96)** in the web interface. Viewed from
+the front, the chain begins at the top-right and proceeds from top to bottom,
+three panels at a time. Rotate the first, third, and fifth physical rows by 180
+degrees:
+
+```text
+           [ 3] <- [ 2] <- [ 1] <- DATA IN
+             |
+           [ 4] -> [ 5] -> [ 6]
+                              |
+           [ 9] <- [ 8] <- [ 7]
+             |
+           [10] -> [11] -> [12]
+                              |
+           [15] <- [14] <- [13]
+             |
+           [16] -> [17] -> [18]
+```
+
+In this mode the controller receives `96x96` RGB565 bitmaps on UDP port `5001`.
+A complete frame is 18,432 bytes, so it is split into 18 packets to fit the
+W5100S socket buffer. Each packet consists of an 8-byte header followed by up
+to 1,024 bytes of pixel data:
+
+The RP2040 drives this larger matrix with 1-bit color per RGB channel and a
+single framebuffer to stay within available RAM and leave more scan time for
+Ethernet. That provides eight simple colors: black, red, green, blue, cyan,
+magenta, yellow, and white. Incoming chunks are written directly into the
+framebuffer; RGB565 input is quantized for the panel.
+
+```text
+bytes 0..3  "RGBU"
+bytes 4..5  frame ID, big endian
+byte  6     chunk index (0..17)
+byte  7     chunk count (18)
+bytes 8..   row-major RGB565 pixels, big endian
+```
+
+Use the included sender, which resizes any Pillow-supported image to `96x96`,
+transmits the chunks, retries once by default, and waits for the controller's
+completion acknowledgement. Its default 250 ms inter-packet delay prevents the
+W5100S receive buffer from overflowing while the RP2040 copies pixels:
+
+```sh
+python3 send_bitmap_udp.py image.png --host 192.168.100.23
+```
+
+Install Pillow on the sending computer if necessary with `python3 -m pip
+install Pillow`. Text UDP remains available on port `5000`.
+
 ## First setup
 
 After DHCP completes, the panel shows its IP address. Open that address in a
@@ -123,11 +176,11 @@ it to the active panel canvas and sends RGB565 data, which is stored as
 the filesystem during normal operation, so the USB CIRCUITPY drive is
 read-only to the host; use the UF2 bootloader when firmware files must change.
 
-Panel count (`3`, `6`, `9`, or `12`) is persistent and configurable in the web
+Panel count (`3`, `6`, `9`, `12`, or `18`) is persistent and configurable in the web
 UI. Changing it restarts the controller so the HUB75 framebuffer can be rebuilt
-at `96x16`, `192x16`, `288x16`, or `192x32`, respectively. The first three
-layouts are single horizontal rows; the 12-panel layout is the 6-by-2
-serpentine wall shown above.
+at `96x16`, `192x16`, `288x16`, `192x32`, or `96x96`, respectively. The first
+three layouts are single horizontal rows; the 12- and 18-panel layouts are the
+serpentine walls shown above.
 
 ## Network
 
