@@ -1,11 +1,31 @@
 # W5100S-EVB-PICO RGB Panel Ethernet
 
 CircuitPython controller for `32x16` HUB75 panels. It supports horizontal
-chains of 3, 6, or 9 panels, a 12-panel serpentine wall arranged as six panels
-across by two panels high, and a special 18-panel 3-by-6 serpentine bitmap wall.
+chains of 6 or 9 panels, a vertically mounted and flipped three-panel `16x96`
+mirrored bitmap column, a
+12-panel serpentine wall arranged as six panels across by two panels high, and
+a special 18-panel 3-by-6 serpentine bitmap wall.
 The 12-panel wall behaves as one `192x32` display and is the default layout on
 a fresh installation. Its default `4x` font fills the entire 32-pixel display
 height. The special 18-panel mode behaves as one `96x96` display.
+
+### 3-panel 16x96 flipped bitmap layout
+
+The three-panel mode treats the horizontal `96x16` HUB75 chain as a vertically
+mounted `16x96` logical canvas. It flips the bitmap top-to-bottom and mirrors
+it left-to-right, so source top is displayed at the bottom and source left is
+displayed at the right. It
+receives complete RGB565 frames on UDP port `5001` using the same chunk header
+documented for the 96x96 mode below. A `16x96` frame is 3,072 bytes and is sent
+as three chunks.
+Its HTTP interface remains available for configuration and direct bitmap
+uploads; only the larger 96x96 mode disables HTTP to protect UDP reliability.
+
+Send a source image to the three-panel column with:
+
+```bash
+python3 send_bitmap_udp.py image.png --host 192.168.100.28 --width 16 --height 96
+```
 
 ## Install on the W5100S-EVB-PICO
 
@@ -98,6 +118,11 @@ A complete frame is 18,432 bytes, so it is split into 18 packets to fit the
 W5100S socket buffer. Each packet consists of an 8-byte header followed by up
 to 1,024 bytes of pixel data:
 
+The 96x96 installation mode disables the HTTP socket so TCP activity cannot
+stall the W5100S driver and interrupt bitmap reception. Configure its static IP
+and panel count before selecting 18-panel mode; normal text UDP `5000` and
+bitmap UDP `5001` remain active.
+
 The RP2040 drives this larger matrix with 1-bit color per RGB channel and a
 single framebuffer to stay within available RAM and leave more scan time for
 Ethernet. That provides eight simple colors: black, red, green, blue, cyan,
@@ -187,6 +212,11 @@ serpentine walls shown above.
 The web UI supports DHCP or a static IPv4 address, subnet mask, gateway, and DNS
 server. When changing to a static address, reconnect the browser using the new
 address after the board reloads.
+
+Each controller derives a locally administered Ethernet MAC address from its
+Pico hardware UID. This is required when several W5100S boards share a LAN;
+using the WIZnet default `DE:AD:BE:EF:FE:ED` on every board causes switch and
+ARP-table conflicts even when their IPv4 addresses differ.
 
 Static IP mode is intended for permanent installations. At boot the panel wall
 stays completely blank: it does not show the network message, its IP address,

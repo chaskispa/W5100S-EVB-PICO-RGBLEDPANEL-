@@ -171,27 +171,47 @@ panel_count = config["panel_count"]
 # HUB75 display -------------------------------------------------------------
 
 # Multi-row installations fold the chain at the end of each row. The 12-panel
-# layout is 6x2 (192x32); the special bitmap layout is 3x6 (96x96).
-if panel_count == 18:
+# layout is 6x2 (192x32); the special bitmap layouts are a vertically mounted,
+# top-to-bottom flipped and horizontally mirrored three-panel column (16x96)
+# and the 18-panel 3x6 wall.
+bitmap_mode = panel_count in (3, 18)
+if panel_count == 3:
+    panel_columns = 3
+    panel_rows = 1
+    matrix_width = PANEL_HEIGHT
+    matrix_height = PANEL_WIDTH * panel_count
+    framebuffer_width = PANEL_WIDTH * panel_count
+    framebuffer_height = PANEL_HEIGHT
+elif panel_count == 18:
     panel_columns = 3
     panel_rows = 6
+    matrix_width = PANEL_WIDTH * panel_columns
+    matrix_height = PANEL_HEIGHT * panel_rows
+    framebuffer_width = matrix_width
+    framebuffer_height = matrix_height
 elif panel_count == 12:
     panel_columns = 6
     panel_rows = 2
+    matrix_width = PANEL_WIDTH * panel_columns
+    matrix_height = PANEL_HEIGHT * panel_rows
+    framebuffer_width = matrix_width
+    framebuffer_height = matrix_height
 else:
     panel_columns = panel_count
     panel_rows = 1
-matrix_width = PANEL_WIDTH * panel_columns
-matrix_height = PANEL_HEIGHT * panel_rows
+    matrix_width = PANEL_WIDTH * panel_columns
+    matrix_height = PANEL_HEIGHT * panel_rows
+    framebuffer_width = matrix_width
+    framebuffer_height = matrix_height
 displayio.release_displays()
 matrix = rgbmatrix.RGBMatrix(
-    width=matrix_width,
-    height=matrix_height,
+    width=framebuffer_width,
+    height=framebuffer_height,
     # The 96x96 installation only needs the eight combinations of full/off
     # red, green, and blue. One bit per channel also leaves more RAM and scan
     # time available for Ethernet traffic.
     bit_depth=1 if panel_count == 18 else BIT_DEPTH,
-    doublebuffer=panel_count != 18,
+    doublebuffer=not bitmap_mode,
     tile=panel_rows,
     # The 18-panel wall begins at the top-right and snakes downward in rows.
     # Its first row is the rotated row, opposite Protomatter's built-in parity,
@@ -204,7 +224,7 @@ matrix = rgbmatrix.RGBMatrix(
     latch_pin=board.GP10,
     output_enable_pin=board.GP11,
 )
-matrix_buffer = memoryview(matrix) if panel_count == 18 else None
+matrix_buffer = memoryview(matrix) if bitmap_mode else None
 display = framebufferio.FramebufferDisplay(matrix, auto_refresh=False, rotation=0)
 with open("/font5x8.bin", "rb") as font_file:
     led_font_data = font_file.read()
@@ -263,8 +283,25 @@ def top_down_serpentine_index(source_pixel):
     )
 
 
+def bitmap_storage_index(source_pixel):
+    """Map a logical bitmap pixel into the physical HUB75 framebuffer."""
+    if panel_count == 18:
+        return top_down_serpentine_index(source_pixel)
+    if panel_count == 3:
+        # The physical 96x16 chain is mounted vertically. Reverse logical Y so
+        # the source top appears at the physical bottom, and mirror logical X
+        # so the source left appears at the physical right.
+        source_x = source_pixel % matrix_width
+        source_y = source_pixel // matrix_width
+        return (
+            source_x * framebuffer_width
+            + (matrix_height - 1 - source_y)
+        )
+    return source_pixel
+
+
 def special_text_pixel(x, y, color):
-    """Draw one logical text pixel through the verified 18-panel mapping."""
+    """Draw one logical text pixel through a bitmap installation mapping."""
     if x < 0 or x >= matrix_width or y < 0 or y >= matrix_height:
         return
     adjusted = panel_color(color)
@@ -273,7 +310,7 @@ def special_text_pixel(x, y, color):
         | ((adjusted >> 10) & 0x3F) << 5
         | ((adjusted >> 3) & 0x1F)
     )
-    matrix_buffer[top_down_serpentine_index(y * matrix_width + x)] = rgb565
+    matrix_buffer[bitmap_storage_index(y * matrix_width + x)] = rgb565
 
 
 def panel_rgb565(value):
@@ -374,7 +411,7 @@ def build_text(message, use_entrance=True):
     max_chars = 80 if config["animation"] != "static" else max_chars
     clean, visible_text, character_colors = parse_colored_text(message, max_chars)
     last_message = clean
-    if panel_count == 18:
+    if bitmap_mode:
         text_group = None
         text_label = None
         text_bitmap = None
@@ -518,6 +555,21 @@ def show_saved_bitmap():
             height = int.from_bytes(bitmap_file.read(2), "big")
             if width != matrix_width or height != matrix_height:
                 return False
+            if bitmap_mode:
+                display.root_group = displayio.Group()
+                display.refresh(minimum_frames_per_second=0)
+                for pixel in range(width * height):
+                    packed = bitmap_file.read(2)
+                    if len(packed) != 2:
+                        return False
+                    matrix_buffer[bitmap_storage_index(pixel)] = panel_rgb565(
+                        (packed[0] << 8) | packed[1]
+                    )
+                matrix.refresh()
+                image_bitmap = None
+                image_tile = None
+                print("Saved bitmap displayed")
+                return True
             image_bitmap = displayio.Bitmap(width, height, 65536)
             for pixel in range(width * height):
                 packed = bitmap_file.read(2)
@@ -603,7 +655,24 @@ else:
 
 cs = digitalio.DigitalInOut(board.GP17)
 spi_bus = busio.SPI(board.GP18, MOSI=board.GP19, MISO=board.GP16)
-ethernet = WIZNET5K(spi_bus, cs, is_dhcp=config["dhcp"])
+cpu_uid = bytes(microcontroller.cpu.uid)
+# The WIZnet library's default DE:AD:BE:EF:FE:ED address causes multiple
+# controllers on one LAN to fight over the same switch/ARP entry. Use a
+# locally administered unicast address derived from this Pico's unique ID.
+ethernet_mac_bytes = (
+    0x02,
+    cpu_uid[-5],
+    cpu_uid[-4],
+    cpu_uid[-3],
+    cpu_uid[-2],
+    cpu_uid[-1],
+)
+ethernet_mac = ":".join(
+    "{:02X}".format(value) for value in ethernet_mac_bytes
+)
+ethernet = WIZNET5K(
+    spi_bus, cs, is_dhcp=config["dhcp"], mac=ethernet_mac
+)
 pool = socketpool.SocketPool(ethernet)
 if not config["dhcp"]:
     ethernet.ifconfig = tuple(
@@ -622,10 +691,12 @@ text_udp = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
 text_udp.settimeout(0)
 text_udp.bind((ip_address, TEXT_UDP_PORT))
 
-http_server = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
-http_server.settimeout(0)
-http_server.bind((ip_address, HTTP_PORT))
-http_server.listen(1)
+http_server = None
+if panel_count != 18:
+    http_server = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
+    http_server.settimeout(0)
+    http_server.bind((ip_address, HTTP_PORT))
+    http_server.listen(1)
 text_packet = bytearray(1024)
 
 bitmap_udp = None
@@ -634,7 +705,7 @@ bitmap_frame_bytes = matrix_width * matrix_height * 2
 bitmap_chunk_count = (
     bitmap_frame_bytes + BITMAP_UDP_CHUNK_SIZE - 1
 ) // BITMAP_UDP_CHUNK_SIZE
-if panel_count == 18:
+if bitmap_mode:
     bitmap_udp = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
     bitmap_udp.settimeout(0)
     bitmap_udp.bind((ip_address, BITMAP_UDP_PORT))
@@ -659,7 +730,7 @@ def poll_text_udp():
 
 
 def poll_bitmap_udp():
-    """Receive one chunk of a 96x96 RGB565 frame in special panel mode."""
+    """Receive one chunk of an RGB565 frame in a bitmap installation mode."""
     global bitmap_frame_id, bitmap_chunks_received, bitmap_frame_complete
     global text_group, pending_message, image_bitmap, image_tile
     if bitmap_udp is None:
@@ -707,7 +778,7 @@ def poll_bitmap_udp():
     source_pixel = byte_offset // 2
     payload_start = BITMAP_UDP_HEADER_SIZE
     for source_index in range(payload_start, size, 2):
-        matrix_buffer[top_down_serpentine_index(source_pixel)] = panel_rgb565(
+        matrix_buffer[bitmap_storage_index(source_pixel)] = panel_rgb565(
             (bitmap_packet[source_index] << 8)
             | bitmap_packet[source_index + 1]
         )
@@ -799,7 +870,9 @@ def web_page(message=""):
     out_options = text_option("none", config["animation_out"], "None")
     out_options += text_option("left", config["animation_out"], "Slide to left")
     out_options += text_option("right", config["animation_out"], "Slide to right")
-    panel_options = option(3, config["panel_count"], "3 panels (96x16)")
+    panel_options = option(
+        3, config["panel_count"], "3 panels vertical mirrored (16x96 bitmap)"
+    )
     panel_options += option(6, config["panel_count"], "6 panels (192x16)")
     panel_options += option(9, config["panel_count"], "9 panels (288x16)")
     panel_options += option(
@@ -810,7 +883,7 @@ def web_page(message=""):
     )
     bitmap_udp_status = (
         " &middot; Bitmap UDP {}".format(BITMAP_UDP_PORT)
-        if panel_count == 18 else ""
+        if bitmap_mode else ""
     )
     notice = "<p class='ok'>{}</p>".format(message) if message else ""
     return """<!doctype html><html><head><meta charset='utf-8'>
@@ -912,6 +985,8 @@ def send_http(client, status, body):
 
 def restart_http_listener():
     """Reuse the listener socket after serving an HTTP request in place."""
+    if http_server is None:
+        return
     http_server.settimeout(0)
     try:
         ethernet.socket_close(http_server._socknum)
@@ -925,6 +1000,8 @@ def restart_http_listener():
 
 def poll_http():
     global config
+    if http_server is None:
+        return False
     try:
         status = http_server._status
     except Exception:
@@ -1058,10 +1135,16 @@ def poll_http():
 
 
 print("RGB Ethernet UDP text ready")
-print("IP:", ip_address, "Web: http://{}/".format(ip_address))
+if http_server is None:
+    print("IP:", ip_address, "Web: disabled in UDP bitmap installation mode")
+else:
+    print("IP:", ip_address, "Web: http://{}/".format(ip_address))
+print("MAC:", ethernet_mac)
 print("Panels:", panel_count, "Layout:", panel_columns, "x", panel_rows,
       "Canvas:", matrix_width, "x", matrix_height,
-      "Serpentine:", "top-down rows" if panel_count == 18 else panel_rows > 1)
+      "Mapping:", "vertical column, top/bottom flipped, mirrored" if panel_count == 3 else
+      ("top-down rows" if panel_count == 18 else
+       ("serpentine" if panel_rows > 1 else "linear")))
 print("UDP text port:", TEXT_UDP_PORT)
 if bitmap_udp is not None:
     print("UDP bitmap port:", BITMAP_UDP_PORT,
@@ -1082,7 +1165,7 @@ while True:
     poll_text_udp()
     update_animation()
     now = time.monotonic()
-    if now - last_http_poll >= HTTP_POLL_INTERVAL:
+    if http_server is not None and now - last_http_poll >= HTTP_POLL_INTERVAL:
         last_http_poll = now
         if poll_http():
             time.sleep(0.5)

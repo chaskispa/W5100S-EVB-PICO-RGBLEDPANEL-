@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send a 96x96 RGB565 bitmap to the special RGB Ethernet layout."""
+"""Send an RGB565 bitmap to an RGB Ethernet UDP bitmap layout."""
 
 import argparse
 import socket
@@ -8,13 +8,11 @@ import time
 from PIL import Image
 
 
-WIDTH = 96
-HEIGHT = 96
+DEFAULT_WIDTH = 96
+DEFAULT_HEIGHT = 96
 PORT = 5001
 MAGIC = b"RGBU"
 CHUNK_SIZE = 1024
-FRAME_BYTES = WIDTH * HEIGHT * 2
-CHUNK_COUNT = (FRAME_BYTES + CHUNK_SIZE - 1) // CHUNK_SIZE
 
 
 def rgb565_bytes(image):
@@ -25,16 +23,14 @@ def rgb565_bytes(image):
     return bytes(output)
 
 
-def frame_packets(payload, frame_id):
-    if len(payload) != FRAME_BYTES:
-        raise ValueError("Expected {} RGB565 bytes".format(FRAME_BYTES))
-    for chunk_index in range(CHUNK_COUNT):
+def frame_packets(payload, frame_id, chunk_count):
+    for chunk_index in range(chunk_count):
         offset = chunk_index * CHUNK_SIZE
         header = MAGIC + bytes((
             frame_id >> 8,
             frame_id & 0xFF,
             chunk_index,
-            CHUNK_COUNT,
+            chunk_count,
         ))
         yield header + payload[offset:offset + CHUNK_SIZE]
 
@@ -44,17 +40,30 @@ def main():
     parser.add_argument("image", help="PNG, JPEG, or another Pillow image")
     parser.add_argument("--host", required=True, help="Display IPv4 address")
     parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--width", type=int, default=DEFAULT_WIDTH,
+                        help="Logical frame width (16 for the 3-panel column)")
+    parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT,
+                        help="Logical frame height (96 for bitmap modes)")
     parser.add_argument("--retries", type=int, default=2,
                         help="Complete-frame transmission attempts")
     parser.add_argument("--delay", type=float, default=0.25,
                         help="Seconds between UDP chunks")
     args = parser.parse_args()
 
+    if args.width <= 0 or args.height <= 0:
+        parser.error("width and height must be positive")
+    frame_bytes = args.width * args.height * 2
+    chunk_count = (frame_bytes + CHUNK_SIZE - 1) // CHUNK_SIZE
+    if chunk_count > 255:
+        parser.error("frame requires more than 255 UDP chunks")
+
     with Image.open(args.image) as source:
         image = source.convert("RGB").resize(
-            (WIDTH, HEIGHT), Image.Resampling.LANCZOS
+            (args.width, args.height), Image.Resampling.LANCZOS
         )
     payload = rgb565_bytes(image)
+    if len(payload) != frame_bytes:
+        raise RuntimeError("Unexpected RGB565 payload size")
     frame_id = int(time.monotonic() * 1000) & 0xFFFF
     expected_ack = MAGIC + bytes((frame_id >> 8, frame_id & 0xFF)) + b"OK"
 
@@ -62,7 +71,7 @@ def main():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
         udp.settimeout(1.0)
         for _ in range(max(1, args.retries)):
-            for packet in frame_packets(payload, frame_id):
+            for packet in frame_packets(payload, frame_id, chunk_count):
                 udp.sendto(packet, (args.host, args.port))
                 time.sleep(max(0, args.delay))
             try:
@@ -75,8 +84,8 @@ def main():
 
     if not acknowledged:
         raise RuntimeError("Display did not acknowledge the complete bitmap")
-    print("Sent 96x96 RGB565 frame {} ({} bytes in {} chunks)".format(
-        frame_id, len(payload), CHUNK_COUNT
+    print("Sent {}x{} RGB565 frame {} ({} bytes in {} chunks)".format(
+        args.width, args.height, frame_id, len(payload), chunk_count
     ))
 
 
